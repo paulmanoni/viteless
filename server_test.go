@@ -16,6 +16,7 @@ type fakeHost struct {
 		src  string
 		kind string
 	}
+	failTransform bool
 }
 
 func (h *fakeHost) LoadModule(p string) ([]byte, string, bool) {
@@ -26,8 +27,20 @@ func (h *fakeHost) LoadModule(p string) ([]byte, string, bool) {
 	return []byte(m.src), m.kind, true
 }
 
-// Transform here is a passthrough (the fake "source" is already JS).
-func (h *fakeHost) Transform(p string, src []byte) ([]byte, error) { return src, nil }
+// Transform here is a passthrough (the fake "source" is already JS),
+// unless failTransform is set — then it errors so the overlay path runs.
+func (h *fakeHost) Transform(p string, src []byte) ([]byte, error) {
+	if h.failTransform {
+		return nil, errDummyTransform
+	}
+	return src, nil
+}
+
+var errDummyTransform = errTransform("boom")
+
+type errTransform string
+
+func (e errTransform) Error() string { return string(e) }
 
 func (h *fakeHost) ResolveImport(spec string, kind SpecKind, importer string) string {
 	switch kind {
@@ -50,6 +63,22 @@ func newTestServer() *httptest.Server {
 		"/logo.png":    {src: ``, kind: "asset"},
 	}}
 	return httptest.NewServer(NewServer(h).Handler())
+}
+
+// newTestHost returns the same in-memory host used by newTestServer, plus
+// an index.html (kind "html") and a non-empty asset so the raw/url and
+// proxy tests have something to serve.
+func newTestHost() *fakeHost {
+	return &fakeHost{mods: map[string]struct {
+		src  string
+		kind string
+	}{
+		"/src/main.js": {src: `import { h } from "vue"; import App from "./App.js"; console.log(h, App);`, kind: "js"},
+		"/src/App.js":  {src: `export default { name: "App" };`, kind: "js"},
+		"/src/x.css":   {src: `.a{color:red}`, kind: "css"},
+		"/logo.png":    {src: "PNGBYTES", kind: "asset"},
+		"/index.html":  {src: "<html><head></head><body><script type=\"module\" src=\"/src/main.js\"></script></body></html>", kind: "html"},
+	}}
 }
 
 func get(t *testing.T, base, p string) (int, string) {
@@ -113,8 +142,114 @@ func TestServer_AssetServedAsURLExport(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("status %d", code)
 	}
-	if !strings.Contains(body, `export default "/logo.png"`) {
-		t.Errorf("asset not served as URL export:\n%s", body)
+	// Default import binds to the asset's ?url path (which yields raw bytes).
+	if !strings.Contains(body, `export default "/logo.png?url"`) {
+		t.Errorf("asset not served as ?url export:\n%s", body)
+	}
+}
+
+func TestServer_AssetURLQueryServesRawBytes(t *testing.T) {
+	ts := httptest.NewServer(NewServer(newTestHost()).Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/logo.png?url")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if string(b) != "PNGBYTES" {
+		t.Errorf("?url should serve raw bytes, got %q", string(b))
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "image/png") {
+		t.Errorf("?url content-type = %q, want image/png", ct)
+	}
+}
+
+func TestServer_RawQueryReturnsStringModule(t *testing.T) {
+	ts := httptest.NewServer(NewServer(newTestHost()).Handler())
+	defer ts.Close()
+	code, body := get(t, ts.URL, "/src/x.css?raw")
+	if code != 200 {
+		t.Fatalf("status %d", code)
+	}
+	if !strings.Contains(body, `export default ".a{color:red}"`) {
+		t.Errorf("?raw should export source as string:\n%s", body)
+	}
+}
+
+func TestServer_InjectsHotContextIntoJS(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+	_, body := get(t, ts.URL, "/src/main.js")
+	if !strings.Contains(body, `import.meta.hot = __viteless_hot("/src/main.js")`) {
+		t.Errorf("js module missing hot-context preamble:\n%s", body)
+	}
+}
+
+func TestServer_InjectsHotContextIntoCSS(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+	_, body := get(t, ts.URL, "/src/x.css")
+	if !strings.Contains(body, `import.meta.hot = __viteless_hot("/src/x.css")`) {
+		t.Errorf("css module missing hot-context preamble:\n%s", body)
+	}
+}
+
+func TestServer_ServesTransformedHTML(t *testing.T) {
+	ts := httptest.NewServer(NewServer(newTestHost()).Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("html content-type = %q", ct)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	body := string(b)
+	if !strings.Contains(body, `/@viteless/client.js`) {
+		t.Errorf("html not injected with HMR client:\n%s", body)
+	}
+	// Client must precede the entry module so __viteless_hot is defined first.
+	if strings.Index(body, "/@viteless/client.js") > strings.Index(body, "/src/main.js") {
+		t.Errorf("client script must come before entry module:\n%s", body)
+	}
+}
+
+func TestServer_TransformHTMLInjectsClient(t *testing.T) {
+	s := NewServer(newTestHost())
+	out := string(s.TransformHTML([]byte("<html><head></head><body></body></html>")))
+	if !strings.Contains(out, `/@viteless/client.js`) {
+		t.Errorf("TransformHTML did not inject client:\n%s", out)
+	}
+}
+
+func TestServer_ProxyFallbackForUnservedPaths(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("API:" + r.URL.Path))
+	}))
+	defer backend.Close()
+	ts := httptest.NewServer(NewServer(newTestHost(), WithProxy(backend.URL)).Handler())
+	defer ts.Close()
+	code, body := get(t, ts.URL, "/graphql")
+	if code != 200 || body != "API:/graphql" {
+		t.Errorf("unserved path should proxy to backend; got %d %q", code, body)
+	}
+}
+
+func TestServer_TransformErrorRendersOverlay(t *testing.T) {
+	h := newTestHost()
+	h.mods["/src/bad.js"] = struct {
+		src  string
+		kind string
+	}{src: "<<<broken", kind: "js"}
+	h.failTransform = true
+	ts := httptest.NewServer(NewServer(h).Handler())
+	defer ts.Close()
+	_, body := get(t, ts.URL, "/src/bad.js")
+	if !strings.Contains(body, "__viteless_error") {
+		t.Errorf("transform failure should emit overlay module:\n%s", body)
 	}
 }
 

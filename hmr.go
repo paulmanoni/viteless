@@ -106,11 +106,15 @@ const clientRuntimeJS = `// viteless dev client
       invalidate() { location.reload(); },
     };
   };
+  function clearOverlay() {
+    const el = document.getElementById('__viteless_error');
+    if (el) el.remove();
+  }
   async function applyUpdate(path) {
     const entry = registry.get(path);
     try {
       const mod = await import(path + (path.includes('?') ? '&' : '?') + 't=' + Date.now());
-      if (entry && entry.accept) { entry.accept(mod); console.debug('[viteless] hot', path); }
+      if (entry && entry.accept) { entry.accept(mod); clearOverlay(); console.debug('[viteless] hot', path); }
       else { location.reload(); }
     } catch (e) { console.warn('[viteless] update failed, reloading', e); location.reload(); }
   }
