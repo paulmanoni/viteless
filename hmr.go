@@ -112,16 +112,41 @@ const clientRuntimeJS = `// viteless dev client
   }
   async function applyUpdate(path) {
     const entry = registry.get(path);
+    if (!entry) {
+      console.warn('[viteless] no hot entry for', path, '— reloading (module never ran its import.meta.hot preamble?)');
+      location.reload();
+      return;
+    }
+    if (typeof entry.accept !== 'function') {
+      console.warn('[viteless] module', path, 'did not self-accept — reloading');
+      location.reload();
+      return;
+    }
+    let mod;
     try {
-      const mod = await import(path + (path.includes('?') ? '&' : '?') + 't=' + Date.now());
-      if (entry && entry.accept) { entry.accept(mod); clearOverlay(); console.debug('[viteless] hot', path); }
-      else { location.reload(); }
-    } catch (e) { console.warn('[viteless] update failed, reloading', e); location.reload(); }
+      mod = await import(path + (path.includes('?') ? '&' : '?') + 't=' + Date.now());
+    } catch (e) {
+      console.warn('[viteless] re-import failed for', path, '— reloading', e);
+      location.reload();
+      return;
+    }
+    try {
+      entry.accept(mod);
+      clearOverlay();
+      console.info('[viteless] hot-updated', path);
+    } catch (e) {
+      // The accept callback threw (e.g. Vue reload found no record for the
+      // component __hmrId). Surface it rather than silently doing nothing.
+      console.error('[viteless] hot-apply threw for', path, '— reloading', e);
+      location.reload();
+    }
   }
   function connect() {
     const es = new EventSource('/@viteless/hmr');
+    es.onopen = () => console.info('[viteless] connected — HMR active');
     es.onmessage = (e) => {
       let msg; try { msg = JSON.parse(e.data); } catch { return; }
+      console.debug('[viteless] message', msg);
       if (msg.type === 'reload') { location.reload(); return; }
       if (msg.type === 'update' || msg.type === 'css') { applyUpdate(msg.path); return; }
     };
