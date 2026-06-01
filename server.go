@@ -70,6 +70,42 @@ func WithProxy(target string) Option {
 	}
 }
 
+// WithProxyResolver is like WithProxy but resolves the backend target
+// lazily, per request, by calling resolve(). This is for embedders that
+// don't know the backend address at construction time — e.g. a dev runner
+// that discovers the app's real bind port from its startup logs only after
+// the dev server is already listening. resolve() returning "" (not yet
+// known, or an unparseable value) makes that request 502 rather than
+// crashing; the next request re-resolves, so it self-heals once the
+// address is available.
+func WithProxyResolver(resolve func() string) Option {
+	return func(s *Server) {
+		if resolve == nil {
+			return
+		}
+		s.proxy = &httputil.ReverseProxy{
+			Director: func(req *http.Request) {
+				target := resolve()
+				u, err := url.Parse(target)
+				if err != nil || u.Scheme == "" || u.Host == "" {
+					// Mark unroutable; ErrorHandler turns it into a 502.
+					req.URL.Scheme = ""
+					req.URL.Host = ""
+					return
+				}
+				req.URL.Scheme = u.Scheme
+				req.URL.Host = u.Host
+				if _, ok := req.Header["User-Agent"]; !ok {
+					req.Header.Set("User-Agent", "")
+				}
+			},
+			ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+				http.Error(w, "viteless: backend not reachable yet", http.StatusBadGateway)
+			},
+		}
+	}
+}
+
 // NewServer builds a dev server backed by host.
 func NewServer(host Host, opts ...Option) *Server {
 	s := &Server{host: host, hmr: NewHMR()}

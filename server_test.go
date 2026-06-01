@@ -238,6 +238,30 @@ func TestServer_ProxyFallbackForUnservedPaths(t *testing.T) {
 	}
 }
 
+func TestServer_ProxyResolverResolvesLazily(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("API:" + r.URL.Path))
+	}))
+	defer backend.Close()
+
+	// target is empty until "discovered" — mirrors a dev runner that
+	// learns the backend addr only after the app boots.
+	var target string
+	ts := httptest.NewServer(NewServer(newTestHost(), WithProxyResolver(func() string { return target })).Handler())
+	defer ts.Close()
+
+	// Unknown target → 502, not a crash.
+	if code, _ := get(t, ts.URL, "/graphql"); code != 502 {
+		t.Errorf("unresolved target should 502; got %d", code)
+	}
+	// Once resolved, the same path proxies through — self-heals.
+	target = backend.URL
+	code, body := get(t, ts.URL, "/graphql")
+	if code != 200 || body != "API:/graphql" {
+		t.Errorf("after resolve, should proxy; got %d %q", code, body)
+	}
+}
+
 func TestServer_TransformErrorRendersOverlay(t *testing.T) {
 	h := newTestHost()
 	h.mods["/src/bad.js"] = struct {
