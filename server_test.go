@@ -277,6 +277,40 @@ func TestServer_ProxyFallbackForUnservedPaths(t *testing.T) {
 	}
 }
 
+func TestServer_SPAFallbackForDocumentNav(t *testing.T) {
+	// Backend would answer with its own page — the dev server must NOT
+	// reach it for an HTML navigation to a client-side route.
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("BACKEND-INDEX"))
+	}))
+	defer backend.Close()
+	ts := httptest.NewServer(NewServer(newTestHost(), WithProxy(backend.URL)).Handler())
+	defer ts.Close()
+
+	// Refresh of /login (no such file) as a document navigation → SPA shell.
+	req, _ := http.NewRequest("GET", ts.URL+"/login", nil)
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	body := string(b)
+	if strings.Contains(body, "BACKEND-INDEX") {
+		t.Errorf("document nav must serve SPA shell, not proxy to backend:\n%s", body)
+	}
+	if !strings.Contains(body, "/@viteless/client.js") || !strings.Contains(body, "/src/main.js") {
+		t.Errorf("SPA fallback should serve transformed index.html:\n%s", body)
+	}
+
+	// A non-nav API call to the same kind of path still proxies.
+	code, apiBody := get(t, ts.URL, "/graphql")
+	if code != 200 || apiBody != "BACKEND-INDEX" {
+		t.Errorf("API call should still proxy; got %d %q", code, apiBody)
+	}
+}
+
 func TestServer_ProxyResolverResolvesLazily(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("API:" + r.URL.Path))

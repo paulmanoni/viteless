@@ -148,6 +148,23 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 
 	src, kind, ok := s.host.LoadModule(urlPath)
 	if !ok {
+		// SPA fallback: a document navigation to a client-side route
+		// (e.g. refreshing /login, /dashboard) has no matching file. Serve
+		// the transformed index.html so the SPA boots and its router takes
+		// over — exactly what Vite's dev server does. Without this the
+		// request falls through to the proxy and the BACKEND answers with
+		// its own (bundler-built) index.html, which loads the wrong asset
+		// graph and a stale HMR client. Only HTML navigations fall back;
+		// API calls and asset requests still proxy / 404.
+		if isDocumentNav(r) {
+			if html, _, hok := s.host.LoadModule("/index.html"); hok {
+				out := s.TransformHTML(html)
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-cache")
+				_, _ = w.Write(out)
+				return
+			}
+		}
 		if s.proxy != nil {
 			s.proxy.ServeHTTP(w, r)
 			return
@@ -249,6 +266,38 @@ func writeJS(w http.ResponseWriter, b []byte) {
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(b)
+}
+
+// isDocumentNav reports whether the request is a top-level page navigation
+// (a browser loading/refreshing a URL into a tab), as opposed to an API
+// call or a sub-resource fetch. Such navigations to unknown paths are
+// client-side routes that should boot the SPA shell (index.html).
+//
+// The precise modern signal is Sec-Fetch-Dest: document with Sec-Fetch-Mode:
+// navigate. For clients that don't send those (older browsers, curl), fall
+// back to: GET + an Accept header that prefers text/html + a path that
+// doesn't look like a file (no extension in the last segment). The
+// extension guard keeps a genuinely-missing asset (/foo.png) a 404/proxy
+// rather than silently returning HTML.
+func isDocumentNav(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != "" {
+		return false
+	}
+	if r.Header.Get("Sec-Fetch-Dest") == "document" {
+		return true
+	}
+	// Header absent → heuristic fallback.
+	if r.Header.Get("Sec-Fetch-Dest") != "" {
+		return false // some other dest (image/script/empty) — not a nav
+	}
+	if !strings.Contains(r.Header.Get("Accept"), "text/html") {
+		return false
+	}
+	last := r.URL.Path
+	if i := strings.LastIndexByte(last, '/'); i >= 0 {
+		last = last[i+1:]
+	}
+	return !strings.Contains(last, ".")
 }
 
 // isResourceFetch reports whether the browser is fetching this asset as a
