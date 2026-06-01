@@ -165,6 +165,45 @@ func TestServer_AssetURLQueryServesRawBytes(t *testing.T) {
 	}
 }
 
+func TestServer_AssetResourceFetchServesRawBytes(t *testing.T) {
+	ts := httptest.NewServer(NewServer(newTestHost()).Handler())
+	defer ts.Close()
+	// A browser resource fetch (Sec-Fetch-Dest: image) must get raw bytes
+	// even without ?url — a <img src> / <link href> / CSS url() load.
+	req, _ := http.NewRequest("GET", ts.URL+"/logo.png", nil)
+	req.Header.Set("Sec-Fetch-Dest", "image")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if string(b) != "PNGBYTES" {
+		t.Errorf("resource fetch should serve raw bytes, got %q", string(b))
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "image/png") {
+		t.Errorf("content-type = %q, want image/png", ct)
+	}
+}
+
+func TestServer_AssetModuleImportServesURLExport(t *testing.T) {
+	ts := httptest.NewServer(NewServer(newTestHost()).Handler())
+	defer ts.Close()
+	// A JS module import (Sec-Fetch-Dest: script) gets the URL-export
+	// module, not raw bytes.
+	req, _ := http.NewRequest("GET", ts.URL+"/logo.png", nil)
+	req.Header.Set("Sec-Fetch-Dest", "script")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), `export default "/logo.png?url"`) {
+		t.Errorf("module import should get URL export, got %q", string(b))
+	}
+}
+
 func TestServer_RawQueryReturnsStringModule(t *testing.T) {
 	ts := httptest.NewServer(NewServer(newTestHost()).Handler())
 	defer ts.Close()

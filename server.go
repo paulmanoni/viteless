@@ -178,15 +178,21 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 		writeJS(w, []byte(js))
 		return
 	case "asset":
-		if wantURL {
-			// The actual asset fetch: serve raw bytes with a sniffed
-			// content type so <img src>, fonts, etc. render.
+		// Decide raw-bytes vs URL-export-module by HOW the asset was
+		// requested:
+		//   - ?url query, OR a browser resource fetch (<img src>, CSS
+		//     url() font, <link href> favicon — Sec-Fetch-Dest is
+		//     image/font/style/...) → RAW BYTES.
+		//   - otherwise it's a JS module import (`import logo from
+		//     "./x.png"`, dest=script/empty) → a module exporting the
+		//     asset's ?url path.
+		// Without the Sec-Fetch-Dest check a <link href="/favicon.png">
+		// or a CSS-referenced font would receive a JS module and fail to
+		// render — exactly the case a bundler handles at build time.
+		if wantURL || isResourceFetch(r) {
 			serveRaw(w, urlPath, src)
 			return
 		}
-		// Default import → a JS module exporting the asset's own ?url
-		// path, so `import logo from "./x.png"` binds to a fetchable
-		// URL that yields the bytes (the wantURL branch above).
 		js := fmt.Sprintf("export default %q;\n", urlPath+"?url")
 		writeJS(w, []byte(js))
 		return
@@ -243,6 +249,24 @@ func writeJS(w http.ResponseWriter, b []byte) {
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(b)
+}
+
+// isResourceFetch reports whether the browser is fetching this asset as a
+// page resource (an <img>/<link>/CSS-url() request) rather than importing
+// it as a JS module. The modern signal is the Sec-Fetch-Dest header, which
+// browsers set to the request's destination: image / font / style / audio
+// / video / track / object / embed / manifest for resource loads, vs
+// script (or empty, for a dynamic import) for module graph fetches.
+//
+// Defaults to false (module) when the header is absent — e.g. a curl with
+// no Sec-Fetch-Dest gets the JS module unless it passes ?url, which keeps
+// the import-graph contract intact for non-browser clients.
+func isResourceFetch(r *http.Request) bool {
+	switch r.Header.Get("Sec-Fetch-Dest") {
+	case "image", "font", "style", "audio", "video", "track", "object", "embed", "manifest":
+		return true
+	}
+	return false
 }
 
 // serveRaw writes asset bytes with a content type sniffed from the URL
