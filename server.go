@@ -51,6 +51,10 @@ type Server struct {
 	// server.proxy, so same-origin API calls (/graphql, /api/…) reach the
 	// Go app while the SPA is served unbundled. nil → decline → 404.
 	proxy *httputil.ReverseProxy
+	// plugins runs the user/config/built-in plugin hooks (resolveId, load,
+	// transform, transformIndexHtml) around the host in the dev pipeline.
+	// nil when no plugins are configured.
+	plugins *pluginContainer
 }
 
 // Option configures a Server at construction.
@@ -115,6 +119,12 @@ func NewServer(host Host, opts ...Option) *Server {
 	return s
 }
 
+// withPlugins attaches a plugin container so the dev pipeline runs plugin
+// hooks. Set by Dev().
+func withPlugins(c *pluginContainer) Option {
+	return func(s *Server) { s.plugins = c }
+}
+
 // HMR returns the server's hot-module channel so the host can broadcast
 // updates when files change.
 func (s *Server) HMR() *HMR { return s.hmr }
@@ -147,6 +157,14 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 	wantURL := q.Has("url")
 
 	src, kind, ok := s.host.LoadModule(urlPath)
+	if !ok && s.plugins != nil {
+		// A plugin virtual module (its resolveId returned this URL as the
+		// module id, e.g. "/@id/virtual:foo"): serve the plugin's load()
+		// output as a JS module.
+		if code, vok, verr := s.plugins.load(urlPath); verr == nil && vok {
+			src, kind, ok = []byte(code), "js", true
+		}
+	}
 	if !ok {
 		// SPA fallback: a document navigation to a client-side route
 		// (e.g. refreshing /login, /dashboard) has no matching file. Serve
@@ -178,6 +196,19 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 	if wantRaw {
 		writeJS(w, []byte("export default "+jsString(string(src))+";\n"))
 		return
+	}
+
+	// Plugin transform hooks run on the source of code modules (js/ts/vue
+	// → js, and css), before the native compile and the kind-specific
+	// wrapping. This is where Tailwind expands @tailwind in dev and where
+	// user `transform` plugins take effect.
+	if s.plugins != nil && (kind == "css" || kind == "js") {
+		out, terr := s.plugins.transform(string(src), urlPath)
+		if terr != nil {
+			writeJS(w, []byte(errorModule(urlPath, terr.Error())))
+			return
+		}
+		src = []byte(out)
 	}
 
 	switch kind {
@@ -223,7 +254,18 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 		writeJS(w, []byte(errorModule(urlPath, err.Error())))
 		return
 	}
-	out := RewriteImports(string(compiled), urlPath, ClassifySpec, s.host.ResolveImport)
+	resolve := s.host.ResolveImport
+	if s.plugins != nil {
+		// A plugin resolveId hook gets first crack (virtual modules, custom
+		// aliases); it falls through to the host's resolver otherwise.
+		resolve = func(spec string, k SpecKind, imp string) string {
+			if id, ok := s.plugins.resolveId(spec, imp); ok {
+				return id
+			}
+			return s.host.ResolveImport(spec, k, imp)
+		}
+	}
+	out := RewriteImports(string(compiled), urlPath, ClassifySpec, resolve)
 	writeJS(w, []byte(hotPreamble(urlPath)+out))
 }
 
@@ -236,6 +278,13 @@ func (s *Server) handleModule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) TransformHTML(html []byte) []byte {
 	const clientTag = `<script type="module" src="/@viteless/client.js"></script>`
 	h := string(html)
+	// Plugin transformIndexHtml hooks run first (Vite parity), then the
+	// HMR client is injected.
+	if s.plugins != nil {
+		if out, err := s.plugins.transformIndexHtml(h); err == nil {
+			h = out
+		}
+	}
 	// Insert before the first <script> so the client is guaranteed to
 	// execute ahead of the entry module.
 	if i := strings.Index(h, "<script"); i >= 0 {

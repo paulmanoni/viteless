@@ -1,0 +1,9 @@
+{
+  "name": "viteless-vue-example",
+  "private": true,
+  "type": "module",
+  "description": "viteless Vue example. Runs zero-install (deps from esm.sh) OR, after `npm install`, from node_modules automatically.",
+  "dependencies": {
+    "vue": "^3.5"
+  }
+}

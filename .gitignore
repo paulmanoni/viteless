@@ -9,3 +9,13 @@ coverage.*
 
 # OS
 .DS_Store
+
+# viteless build output + dev-populated lockfiles from the example apps
+examples/*/dist/
+examples/*/nexus.lock
+
+# node_modules from `npm install` in an example (enables node_modules dep mode)
+examples/*/node_modules/
+
+# CLI build artifact (go build ./cmd/viteless)
+/viteless

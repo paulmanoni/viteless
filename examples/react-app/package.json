@@ -1,0 +1,10 @@
+{
+  "name": "viteless-react-example",
+  "private": true,
+  "type": "module",
+  "description": "viteless React example. Runs zero-install (deps from esm.sh) OR, after `npm install`, from node_modules automatically.",
+  "dependencies": {
+    "react": "^19",
+    "react-dom": "^19"
+  }
+}
